@@ -792,13 +792,13 @@
         <div class="input-icon icon-stock">📦</div>
         <div>
           <div class="input-card-title">Остатки на вашем складе</div>
-          <div class="input-card-sub">Google Sheets: Артикул | Размер | Остаток | Себест.</div>
+          <div class="input-card-sub">Артикул продавца | Название | Себестоимость | 42 | 44 | 46...</div>
         </div>
       </div>
       <input type="text" class="url-input" id="stock-url"
         placeholder="https://docs.google.com/spreadsheets/d/...">
       <div class="input-hint">
-        ℹ️ Колонки: Артикул продавца, Размер, Остаток на складе, Себестоимость
+        ℹ️ Размеры идут по колонкам — сервис разберёт автоматически
       </div>
     </div>
   </div>
@@ -988,21 +988,71 @@ function col(row, ...names) {
 function num(v) { return parseFloat(String(v).replace(',', '.')) || 0; }
 
 // ──────────────────────────────────────────
-// PARSE STOCK CSV (user's stock table)
+// PARSE STOCK CSV
+// Формат файла: Артикул продавца | Название | Предмет | Себестоимость, руб | 42 | 44 | 46-48 | ...
+// Файл может состоять из нескольких блоков с разными наборами размеров (разделены пустыми строками)
+// Каждый блок начинается со строки-заголовка где первая ячейка = "Артикул" или "Артикул продавца"
 // ──────────────────────────────────────────
 function parseStockCSV(text) {
-  const result = Papa.parse(text, { header: true, skipEmptyLines: true });
+  const result = Papa.parse(text, { skipEmptyLines: false });
+  const allRows = result.data;
+  if (!allRows.length) return {};
+
+  const sizeRe = /^\d{2,3}(-\d{2,3})?$/;
   const map = {};
-  for (const row of result.data) {
-    const art = (row['Артикул продавца'] || row['Артикул'] || '').trim();
-    const size = (row['Размер'] || '').trim();
-    if (!art) continue;
-    const key = art + '|' + size;
-    map[key] = {
-      stock: num(row['Остаток на складе'] || row['Остаток'] || 0),
-      cost: num(row['Себестоимость'] || row['Себест'] || 0),
-    };
+
+  // Разбиваем на блоки — каждый начинается со строки-заголовка
+  let blocks = [];
+  let current = null;
+
+  for (const row of allRows) {
+    const first = (row[0] || '').toString().trim().toLowerCase();
+    if (first === 'артикул' || first === 'артикул продавца') {
+      current = { headers: row.map(h => (h || '').toString().trim()), dataRows: [] };
+      blocks.push(current);
+    } else if (current) {
+      const hasData = row.some(c => c !== null && c !== undefined && String(c).trim() !== '');
+      if (hasData) current.dataRows.push(row);
+    }
   }
+
+  for (const block of blocks) {
+    const headers = block.headers;
+
+    const findCol = (...names) => {
+      for (const n of names) {
+        const i = headers.findIndex(h => h.toLowerCase().includes(n.toLowerCase()));
+        if (i !== -1) return i;
+      }
+      return -1;
+    };
+
+    const artIdx  = findCol('артикул продавца', 'артикул');
+    const costIdx = findCol('себестоимость', 'себест', 'цена');
+
+    // Все колонки-размеры в этом блоке
+    const sizeCols = headers.reduce((acc, h, i) => {
+      if (sizeRe.test(h)) acc.push({ idx: i, size: h });
+      return acc;
+    }, []);
+
+    if (artIdx === -1 || sizeCols.length === 0) continue;
+
+    for (const row of block.dataRows) {
+      const art = (row[artIdx] || '').toString().trim();
+      if (!art || art.toLowerCase() === 'артикул') continue;
+
+      const cost = costIdx !== -1 ? num(row[costIdx]) : 0;
+
+      for (const { idx, size } of sizeCols) {
+        const raw = row[idx];
+        // Пустая ячейка = 0 (размер есть в шаблоне, товара нет)
+        const stock = (raw === null || raw === undefined || String(raw).trim() === '') ? 0 : num(raw);
+        map[art + '|' + size] = { stock, cost };
+      }
+    }
+  }
+
   return map;
 }
 
@@ -1086,9 +1136,12 @@ function processData() {
       const stockKey = a.art + '|' + sz;
       const myStock = stockData[stockKey];
       s.recommended = Math.max(0, needed);
-      s.myStock = myStock ? myStock.stock : null;
-      s.cost = myStock ? myStock.cost : null;
-      s.toDeliver = s.recommended; // editable
+      // myStock может быть 0 — это валидное значение, проверяем наличие ключа
+      s.myStock = (myStock !== undefined) ? myStock.stock : null;
+      s.cost    = (myStock !== undefined) ? myStock.cost  : null;
+      // Ограничиваем поставку тем что реально есть на складе
+      const canDeliver = s.myStock !== null ? Math.min(s.recommended, s.myStock) : s.recommended;
+      s.toDeliver = canDeliver;
     }
   }
 }
@@ -1224,20 +1277,31 @@ function renderDetail(a, idx) {
 
   // Sizes table
   const sizes = Object.entries(a.sizes).sort((x,y) => y[1].bought - x[1].bought);
-  const sizesHTML = sizes.map(([sz, s]) => `
+  const sizesHTML = sizes.map(([sz, s]) => {
+    const myStockCell = s.myStock === null
+      ? '<span style="color:var(--muted)">—</span>'
+      : s.myStock === 0
+        ? '<span style="color:var(--red);font-weight:700">0 шт</span>'
+        : s.myStock < s.recommended
+          ? `<span style="color:var(--yellow);font-weight:700">${s.myStock} шт ⚠</span>`
+          : `<span style="color:var(--green)">${s.myStock} шт</span>`;
+    const sumCell = s.cost && s.toDeliver > 0
+      ? fmt(s.cost * s.toDeliver) + ' ₽'
+      : '—';
+    return `
     <tr>
       <td><strong>${sz}</strong></td>
       <td>${s.bought}</td>
       <td style="color:${s.status==='red'?'var(--red)':s.status==='yellow'?'var(--yellow)':'var(--green)'}">${s.buyoutPct}%</td>
       <td>${s.stockWb}</td>
       <td style="color:${s.daysLeft>=999?'var(--green)':s.daysLeft<=7?'var(--red)':'var(--yellow)'}">${s.daysLeft>=999?'∞':s.daysLeft} дн</td>
-      <td>${s.myStock !== null ? s.myStock + ' шт' : '—'}</td>
+      <td>${myStockCell}</td>
       <td>${s.recommended}</td>
       <td><input type="number" class="deliver-input" value="${s.toDeliver}" min="0"
         onchange="updateDeliver('${a.art}','${sz}',this.value,${idx})"></td>
-      <td>${s.cost ? fmt(s.cost*(s.toDeliver||0)) + ' ₽' : '—'}</td>
-    </tr>
-  `).join('');
+      <td>${sumCell}</td>
+    </tr>`;
+  }).join('');
 
   return `
   <div class="detail-grid">
