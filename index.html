@@ -895,12 +895,24 @@ function setLoading(v) {
 // ──────────────────────────────────────────
 // URL → CSV CONVERTER
 // ──────────────────────────────────────────
-function sheetUrlToCsv(url, gid = '0') {
+// Apps Script прокси (твои собственные — работают без CORS)
+const APPS_SCRIPT_PROXIES = {
+  sales: 'https://script.google.com/macros/s/AKfycbxmGsQ_7sLxNcYZ6baqi2yH7tgBfyi_gBpKhrWyLe6jIFWGldK-hiy4hZg-URlvFEsSFQ/exec',
+  stock: 'https://script.google.com/macros/s/AKfycbwU83HAZrEAZe8X166BXe8lRq0oOs-DOJ7sp1USPFkM6A9w5tfvMO7hzGF0PPSibz-M/exec',
+};
+
+// Резервные публичные CORS-прокси
+const FALLBACK_PROXIES = [
+  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+];
+
+function sheetUrlToCsv(url) {
   const m = url.match(/\/d\/([\w-]+)/);
   if (!m) return null;
   const id = m[1];
   const gidMatch = url.match(/gid=(\d+)/);
-  const sheetGid = gidMatch ? gidMatch[1] : gid;
+  const sheetGid = gidMatch ? gidMatch[1] : '0';
   return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${sheetGid}`;
 }
 
@@ -921,30 +933,64 @@ async function loadData() {
     const salesCsvUrl = sheetUrlToCsv(salesUrl);
     if (!salesCsvUrl) throw new Error('Неверная ссылка на Google Sheets (продажи)');
 
-    const salesText = await fetchCsv(salesCsvUrl);
+    const salesText = await fetchCsv(salesCsvUrl, 'sales');
     salesData = parseSalesCSV(salesText);
 
     if (stockUrl) {
       const stockCsvUrl = sheetUrlToCsv(stockUrl);
       if (!stockCsvUrl) throw new Error('Неверная ссылка на Google Sheets (остатки)');
-      const stockText = await fetchCsv(stockCsvUrl);
+      const stockText = await fetchCsv(stockCsvUrl, 'stock');
       stockData = parseStockCSV(stockText);
     }
 
     processData();
     showAnalytics();
   } catch(e) {
-    showError('Ошибка загрузки: ' + e.message + '. Проверьте что таблица открыта для просмотра по ссылке.');
+    showError(
+      '⚠ Ошибка загрузки: ' + e.message + '\n\n' +
+      'Убедитесь что:\n' +
+      '1. Ссылка ведёт на Google Sheets (не на Excel-файл)\n' +
+      '2. Таблица открыта для просмотра: Настройки доступа → Все у кого есть ссылка → Читатель\n' +
+      '3. Попробуйте открыть ссылку в режиме инкогнито — если таблица открылась, значит доступ настроен правильно'
+    );
   } finally {
     setLoading(false);
     document.getElementById('load-btn').disabled = false;
   }
 }
 
-async function fetchCsv(url) {
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`HTTP ${resp.status} при загрузке данных`);
-  return resp.text();
+async function fetchCsv(csvUrl, type = 'sales') {
+  // 1. Пробуем через твой Apps Script прокси
+  const proxyBase = APPS_SCRIPT_PROXIES[type];
+  try {
+    const proxyUrl = `${proxyBase}?url=${encodeURIComponent(csvUrl)}`;
+    const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(15000) });
+    if (resp.ok) {
+      const text = await resp.text();
+      if (text && text.length > 10) return text;
+    }
+  } catch(e) { /* идём дальше */ }
+
+  // 2. Пробуем напрямую (вдруг Google разрешит)
+  try {
+    const resp = await fetch(csvUrl, { signal: AbortSignal.timeout(6000) });
+    if (resp.ok) return resp.text();
+  } catch(e) { /* CORS */ }
+
+  // 3. Резервные публичные прокси
+  let lastErr = '';
+  for (const proxy of FALLBACK_PROXIES) {
+    try {
+      const resp = await fetch(proxy(csvUrl), { signal: AbortSignal.timeout(10000) });
+      if (resp.ok) {
+        const text = await resp.text();
+        if (text && text.length > 10) return text;
+      }
+      lastErr = `HTTP ${resp.status}`;
+    } catch(e) { lastErr = e.message; }
+  }
+
+  throw new Error(`Не удалось загрузить данные. (${lastErr})`);
 }
 
 // ──────────────────────────────────────────
@@ -954,7 +1000,21 @@ function parseSalesCSV(text) {
   const result = Papa.parse(text, { skipEmptyLines: true });
   const rows = result.data;
 
-  // Find header row (contains "Артикул продавца")
+  // Извлекаем период из первой строки: "...с 01.01.2026 по 24.03.2026..."
+  const firstLine = (rows[0] || []).join(' ');
+  const periodMatch = firstLine.match(/с\s+(\d{2}\.\d{2}\.\d{4})\s+по\s+(\d{2}\.\d{2}\.\d{4})/);
+  if (periodMatch) {
+    const parseDate = s => { const [d,m,y] = s.split('.'); return new Date(y, m-1, d); };
+    const d1 = parseDate(periodMatch[1]);
+    const d2 = parseDate(periodMatch[2]);
+    const days = Math.round((d2 - d1) / (1000 * 60 * 60 * 24)) + 1;
+    if (days > 0) {
+      periodDays = days;
+      console.log(`Период отчёта: ${periodMatch[1]} — ${periodMatch[2]} (${days} дней)`);
+    }
+  }
+
+  // Find header row (contains "Артикул продавца" or "Бренд")
   let headerIdx = 0;
   for (let i = 0; i < Math.min(5, rows.length); i++) {
     if (rows[i].join(',').includes('Артикул продавца') || rows[i].join(',').includes('Бренд')) {
@@ -973,7 +1033,6 @@ function parseSalesCSV(text) {
     data.push(obj);
   }
 
-  // Calculate period days from data
   return data;
 }
 
